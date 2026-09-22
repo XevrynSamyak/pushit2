@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""
+push - a standalone, no-dependency pusher. Stdlib only.
+
+  push                                             numbered picker over changed files
+  push main.c utils.py -r proj                     these files only, no picker
+  push -y -m "wip"                                 commit everything, zero prompts
+  push --dry-run                                   git status only; change nothing
+
+  -r repo        target GitHub repo (owner/name, or a name under your account)
+  -b branch      branch to push (default: main; remembered per project)
+  -m message     commit message (else prompted; type 'e' for $EDITOR)
+  --ssh/--https  transport (default: HTTPS; remembered per project)
+  --public       create the repo public (default: private)
+  -y             never prompt; take every default (auto-writes .gitignore)
+  --reset        forget this project's remembered settings (.pushconfig.json)
+  --selftest     check the internal parsers
+
+Your GitHub username is cached in ~/.push_to_github_config.json (asked once).
+Repo/branch/transport are cached in .pushconfig.json next to the code.
+Every git command is echoed with its output.
+"""
+
+import argparse
+import getpass
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+GITIGNORE = """\
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# C / C++
+*.o
+*.a
+*.so
+*.exe
+*.out
+
+# OS / editors
+.DS_Store
+"""
+
+PROJECT_CONFIG = ".pushconfig.json"
+USER_CONFIG = Path.home() / ".push_to_github_config.json"
+API = "https://api.github.com"
+GH_BASE = "https://github.com"
+SSH_BASE = "git@github.com:"
+
+ROOT = Path.cwd()
+QUICK = False  # -y: never prompt, take every default
+sys.stdout.reconfigure(line_buffering=True)
+
+
+def log(msg, tag=".."):
+    print(f"[{tag}] {msg}")
+
+
+def die(msg, r=None):
+    """Exit 1. With a CompletedProcess, show why it failed first."""
+    if r is not None and (r.stdout or r.stderr).strip():
+        print((r.stdout + r.stderr).rstrip(), file=sys.stderr)
+    sys.exit(f"[!] {msg}")
+
+
+def ask(prompt, default=""):
+    """Ask the user; empty input, no TTY or -y falls back to `default`."""
+    if QUICK:
+        return default
+    try:
+        ans = input(prompt).strip()
+    except (EOFError, OSError, KeyboardInterrupt):
+        return default
+    return ans or default
+
+
+def ask_yes(prompt, default=True):
+    ans = ask(f"{prompt} [{'Y/n' if default else 'y/N'}]: ")
+    return default if not ans else ans.lower().startswith("y")
+
+
+def run(cmd, echo=True):
+    """Run a shell command; every command is echoed with its output."""
+    if echo:
+        print(f"[+$] {cmd}")
+    r = subprocess.run(cmd, shell=True, text=True, capture_output=True, cwd=ROOT, errors="replace")
+    if echo and (r.stdout or r.stderr):
+        print((r.stdout + r.stderr).rstrip())
+    return r
+
+
+def git(args, echo=True):
+    return run("git " + args, echo)
+
+
+def run_silent(cmd):
+    """Run a command quietly; returns stripped stdout (never fails)."""
+    try:
+        r = subprocess.run(cmd, shell=True, text=True, capture_output=True, timeout=10,
+                           errors="replace")
+        return r.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def q(p):
+    return shlex.quote(str(p))
+
+
+def load_json(path):
+    try:
+        data = json.loads(Path(path).read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_json(path, data):
+    try:
+        Path(path).write_text(json.dumps(data, indent=2) + "\n")
+        return True
+    except OSError as e:
+        log(f"could not write {path}: {e}", "!")
+        return False
+
+
+def ensure_git(pref=None):
+    """Make sure we're on a git repo and (if asked) on branch `pref`."""
+    if not (ROOT / ".git").is_dir():
+        r = git(f"init -b {q(pref or 'main')}")
+        if r.returncode:
+            die("could not initialize a git repo here", r)
+        log("initialized git repo", "ok")
+    cur = git("symbolic-ref --short HEAD").stdout.strip() or "main"
+    if pref and pref != cur:
+        r = git(f"checkout -B {q(pref)}")
+        if r.returncode:
+            die(f"could not switch to branch {pref}", r)
+        log(f"on branch {pref}", "ok")
+        cur = pref
+    return cur
+
+
+def ignore(*names):
+    """Create .gitignore if missing, add `names`. True if it changed."""
+    gi = ROOT / ".gitignore"
+    created = not gi.exists()
+    lines = GITIGNORE.splitlines() if created else gi.read_text(errors="ignore").splitlines()
+    new = [n for n in names if n not in lines]
+    if created:
+        log("created .gitignore")
+    if new:
+        log(f"gitignored: {', '.join(new)}")
+    if created or new:
+        gi.write_text("\n".join(lines + new) + "\n")
+    return created or bool(new)
+
+
+def parse_status(text):
+    """Paths out of `git status --porcelain -uall` output."""
+    paths = []
+    for line in text.splitlines():
+        p = line[3:].strip().strip('"').split(" -> ")[-1]  # renames: 'R  old -> new'
+        if p and not p.endswith("/"):
+            paths.append(p)
+    return paths
+
+
+def changed_files():
+    # -uall so files inside a brand-new directory are listed, not just the directory
+    skip = (".gitignore", PROJECT_CONFIG)
+    return [p for p in parse_status(git("status --porcelain -uall").stdout) if p not in skip]
+
+
+def parse_selection(text, n):
+    """'a' -> everything, 'n' -> nothing, '1,3 5-7' -> zero-based indices."""
+    t = text.strip().lower()
+    if t in ("a", "all", ""):
+        return list(range(n))
+    if t in ("n", "none"):
+        return []
+    picked = set()
+    for part in t.replace(",", " ").split():
+        bits = part.split("-")
+        if len(bits) > 2 or not all(b.isdigit() for b in bits):
+            raise ValueError(f"not a number: {part}")
+        lo, hi = int(bits[0]), int(bits[-1])
+        if lo < 1 or hi > n or lo > hi:
+            raise ValueError(f"out of range: {part}")
+        picked.update(range(lo - 1, hi))
+    return sorted(picked)
+
+
+def pick_files(changed):
+    """Numbered picker over changed/untracked files. Returns chosen paths."""
+    if not changed:
+        return []
+    print("\nChanged / untracked files:")
+    for i, p in enumerate(changed, 1):
+        print(f"  {i:>3}. {p}")
+    while True:
+        try:
+            idx = parse_selection(ask("Stage which? (a=all, n=none, e.g. 1,3,5-7): ", "a"), len(changed))
+        except ValueError as e:
+            log(e, "!")
+            continue
+        return [changed[i] for i in idx]
+
+
+def stage(paths):
+    if paths:
+        git("add -A -- " + " ".join(q(p) for p in dict.fromkeys(str(p) for p in paths)))
+    return [l for l in git("diff --cached --name-only").stdout.splitlines() if l]
+
+
+def unstage():
+    if git("rev-parse --verify -q HEAD").returncode == 0:
+        git("reset -q")
+    else:
+        git("rm -r --cached -q -- .")
+
+
+def compose_in_editor(default):
+    """Write the commit message in $EDITOR (typed 'e' at the prompt)."""
+    editor = (os.environ.get("GIT_EDITOR") or os.environ.get("VISUAL")
+              or os.environ.get("EDITOR") or ("notepad" if os.name == "nt" else "vi"))
+    fd, tmp = tempfile.mkstemp(prefix="push_msg_", suffix=".txt")
+    os.close(fd)
+    try:
+        Path(tmp).write_text(default + "\n\n# Lines starting with '#' are ignored.\n")
+        try:
+            subprocess.call(shlex.split(editor, posix=(os.name != "nt")) + [tmp])
+        except OSError as e:
+            log(f"could not launch {editor!r}: {e}", "!")
+            return default
+        body = [l for l in Path(tmp).read_text().splitlines() if not l.startswith("#")]
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return "\n".join(body).strip() or default
+
+
+def commit(staged, message):
+    default = f"auto-commit: {len(staged)} file(s)" if len(staged) != 1 else f"update {Path(staged[0]).name}"
+    if not message:
+        message = ask(f'Commit message ("{default}", or "e" for $EDITOR): ', default)
+        if message.strip().lower() == "e":
+            message = compose_in_editor(default)
+    r = git(f"commit -m {q(message)}")
+    if r.returncode:
+        if "nothing to commit" in r.stdout:
+            return log("nothing to commit")
+        if "user.email" in (r.stdout + r.stderr):
+            log('set your identity first: git config --global user.name "You"', "!")
+            log('                         git config --global user.email "you@example.com"', "!")
+        die("commit failed", r)
+    log(f"committed: {message.splitlines()[0]}", "ok")
+
+
+def gh_token():
+    """A GitHub token: GITHUB_TOKEN env, gh's logged-in token, or a hidden prompt."""
+    if os.environ.get("GITHUB_TOKEN"):
+        return os.environ["GITHUB_TOKEN"].strip()
+    tok = run_silent("gh auth token")
+    if tok:
+        return tok
+    if QUICK:
+        die("no GITHUB_TOKEN and `gh auth token` returned nothing - set GITHUB_TOKEN"
+            " (or run `gh auth login`) to create a repo under -y")
+    tok = getpass.getpass("  GitHub token (hidden; used only to create the repo): ").strip()
+    if not tok:
+        die("a token is required to create the repo - see https://github.com/settings/tokens (scope: repo)")
+    return tok
+
+
+def gh_api(method, path, token=None, body=None):
+    """One GitHub REST API call with urllib. Returns (status, parsed json)."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(API + path, data=data, method=method)
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    req.add_header("User-Agent", "github-push")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+        return resp.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, (json.loads(raw) if raw else {})
+        except ValueError:
+            return e.code, {}
+    except (urllib.error.URLError, OSError) as e:
+        die(f"cannot reach the GitHub API: {e}")
+
+
+def repo_exists(owner, name, token=None):
+    code, data = gh_api("GET", f"/repos/{owner}/{name}", token=token)
+    return code == 200 and bool(data.get("full_name"))
+
+
+def create_repo(name, public, token):
+    vis = "public" if public else "private"
+    log(f"creating {vis} repo '{name}' on GitHub")
+    code, data = gh_api("POST", "/user/repos", token=token,
+                        body={"name": name, "private": not public})
+    if code in (200, 201) and data.get("full_name"):
+        return data["full_name"]
+    msg = data.get("message") if isinstance(data, dict) else ""
+    if isinstance(msg, dict):  # validation failures arrive as {"message": ..., "errors": [...]}
+        msg = str(data.get("errors", msg))
+    die(f"could not create '{name}' on GitHub ({code}): {msg}")
+
+
+def get_username():
+    """Your GitHub login, cached once and reused."""
+    cfg = load_json(USER_CONFIG)
+    if cfg.get("username"):
+        return cfg["username"]
+    owner = run_silent("gh api user --jq .login")
+    if not owner:
+        if QUICK:
+            die("no cached username and no `gh` login - run once without -y to set it, or `gh auth login`")
+        owner = ask("Your GitHub username (cached, asked once): ")
+    if not owner:
+        die("a GitHub username is required")
+    cfg["username"] = owner
+    if save_json(USER_CONFIG, cfg):
+        log(f"remembered your GitHub username in {USER_CONFIG}")
+    return owner
+
+
+def pick_repo(owner, default=None):
+    """Numbered picker over the user's existing GitHub repos. Enter a name to
+    use a new one instead. Returns the chosen repo name without an owner part.
+    """
+    token = gh_token()
+    code, data = gh_api("GET", "/user/repos?per_page=100&sort=updated", token=token)
+    repos = [r["name"] for r in data] if isinstance(data, list) else []
+    if not repos:
+        return default
+    print("\nYour GitHub repos (most recently updated):")
+    for i, name in enumerate(repos, 1):
+        print(f"  {i:>3}. {name}")
+    hint = f" [Enter={default}]" if default else ""
+    while True:
+        ans = ask(f"Push to which repo? (number, or type a new name){hint}: ").strip()
+        if ans.lower() in ("n", "none"):
+            die("no repo chosen - nothing pushed")
+        if not ans and (default or not sys.stdin.isatty()):
+            return default
+        if ans.isdigit():
+            i = int(ans)
+            if 1 <= i <= len(repos):
+                return repos[i - 1]
+            log(f"out of range: {ans}", "!")
+            continue
+        if ans:
+            return ans
+        log("choose a number or type a repo name", "!")
+        continue
+
+
+def ensure_remote(public, repo_name, ssh, owner=None):
+    """Point origin at a GitHub repo, creating it if missing. Names without an
+    "owner/" part are assumed to belong to the logged-in user."""
+    if not repo_name:
+        if "origin" in git("remote", False).stdout.split():
+            return
+        repo_name = ROOT.name.strip().replace(" ", "-")
+
+    if owner and "/" not in repo_name:
+        repo_name = f"{owner}/{repo_name}"
+    elif owner is None and "/" not in repo_name:
+        repo_name = f"{get_username()}/{repo_name}"
+    repo_owner, name = repo_name.split("/", 1)
+
+    token = None
+    exists = repo_exists(repo_owner, name)
+    if not exists:
+        token = gh_token()
+        exists = repo_exists(repo_owner, name, token)
+        if not exists:
+            vis = "public" if public else "private"
+            if QUICK or ask_yes(f"'{repo_name}' doesn't exist on GitHub yet - create it as {vis}?"):
+                full = create_repo(name, public, token)
+                if "/" in full:  # created under the authenticated account, not `owner`
+                    repo_name = full
+                log(f"repo ready: {full}", "ok")
+            else:
+                die("no repo to push to - created nothing")
+
+    url = (SSH_BASE + repo_name + ".git") if ssh else (f"{GH_BASE}/{repo_name}.git")
+    if "origin" in git("remote", False).stdout.split():
+        git(f"remote set-url origin {q(url)}")
+    else:
+        git(f"remote add origin {q(url)}")
+    log(f"targeting {url}", "ok")
+
+
+def push_help(branch, ssh):
+    origin = git("remote get-url origin", False).stdout.strip()
+    print("=" * 68, file=sys.stderr)
+    print("PUSH FAILED - likely causes and fixes:", file=sys.stderr)
+    print(f"  * remote has commits you don't:  git pull --rebase origin {branch}", file=sys.stderr)
+    print(f"    (unrelated histories)          git pull --allow-unrelated-histories origin {branch}", file=sys.stderr)
+    print(f"  * only if you're certain:        git push --force-with-lease origin {branch}", file=sys.stderr)
+    if ssh:
+        print("  * SSH key not registered:        ssh -T git@github.com", file=sys.stderr)
+        print("    add one at https://github.com/settings/keys  (ssh-keygen -t ed25519)", file=sys.stderr)
+    else:
+        print("  * HTTPS auth: gh auth login && gh auth setup-git", file=sys.stderr)
+        print("    or use a PAT as the password: https://github.com/settings/tokens (scope: repo)", file=sys.stderr)
+    print(f"  * wrong target?  origin is {origin or '(unset)'}", file=sys.stderr)
+    print("  * branch protected, or no write access on that repo", file=sys.stderr)
+    print("=" * 68, file=sys.stderr)
+
+
+def push(branch, ssh=False):
+    for last in (False, True):
+        r = git(f"push -u origin {q(branch)}")
+        if not r.returncode:
+            return log(f"pushed to origin/{branch}", "ok")
+        if not last:
+            log("push failed; retrying...", "!")
+    print((r.stdout + r.stderr).rstrip(), file=sys.stderr)
+    push_help(branch, ssh)
+    sys.exit(1)
+
+
+def selftest():
+    global ROOT
+    assert parse_status('?? a.c\n M b.py\nR  old.c -> new.c\n?? "sp ace.c"\n?? d/\n') == \
+        ["a.c", "b.py", "new.c", "sp ace.c"]
+    assert parse_status("") == []
+    assert parse_selection("a", 3) == [0, 1, 2]
+    assert parse_selection("", 3) == [0, 1, 2]
+    assert parse_selection("N", 3) == []
+    assert parse_selection("1,3", 3) == [0, 2]
+    assert parse_selection("2-3 1", 3) == [0, 1, 2]
+    assert parse_selection("2,2", 3) == [1]
+    for bad in ("9", "0", "x", "3-1", "1-99", "1-2-3"):
+        try:
+            parse_selection(bad, 3)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} should have been rejected")
+    with tempfile.TemporaryDirectory() as d:
+        ROOT = Path(d)
+        assert ignore() and (ROOT / ".gitignore").exists()
+        assert ignore("day3") and "day3" in (ROOT / ".gitignore").read_text()
+        assert not ignore("day3")
+        cfg = ROOT / PROJECT_CONFIG
+        assert save_json(cfg, {"repo": "r", "branch": "dev", "ssh": True})
+        assert load_json(cfg) == {"repo": "r", "branch": "dev", "ssh": True}
+        assert load_json(ROOT / "nope.json") == {}
+    log("selftest passed", "ok")
+
+
+def main():
+    global ROOT, QUICK
+    ap = argparse.ArgumentParser(
+        description="Push your work to GitHub. Stdlib only, no installation.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    ap.add_argument("files", nargs="*", help="files to push (default: numbered picker over changed files)")
+    ap.add_argument("-m", "--message", help="commit message (else prompted; 'e' opens $EDITOR)")
+    ap.add_argument("-y", "--quick", action="store_true", help="no prompts at all; take every default")
+    ap.add_argument("-r", "--repo", help="GitHub repo, e.g. -r myproj or -r owner/myproj")
+    ap.add_argument("-b", "--branch", help="branch to push (remembered per project; default main)")
+    ap.add_argument("--ssh", action="store_true", help="use the SSH remote URL")
+    ap.add_argument("--https", action="store_true", help="use the HTTPS remote URL (default)")
+    ap.add_argument("--public", action="store_true", help="create the GitHub repo as public (default: private)")
+    ap.add_argument("--dry-run", action="store_true", help="show git status and change nothing")
+    ap.add_argument("--reset", action="store_true", help=f"forget this project's {PROJECT_CONFIG}")
+    ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
+    if args.ssh and args.https:
+        die("--ssh and --https are mutually exclusive")
+    QUICK = args.quick
+
+    for d in (Path.cwd().resolve(), *Path.cwd().resolve().parents):
+        if (d / ".git").is_dir():
+            ROOT = d
+            break
+    log(f"root: {ROOT}")
+
+    if args.dry_run:
+        if not (ROOT / ".git").is_dir():
+            log("not a git repo yet - push would run `git init -b main` here")
+        else:
+            git("status")
+        log("--dry-run: nothing staged, committed or pushed")
+        return
+
+    # Remembered per-project settings: repo, branch, https/ssh.
+    cfgpath = ROOT / PROJECT_CONFIG
+    if args.reset and cfgpath.exists():
+        cfgpath.unlink()
+        log(f"cleared {PROJECT_CONFIG}")
+    cfg = {} if args.reset else load_json(cfgpath)
+
+    ssh = True if args.ssh else False if args.https else bool(cfg.get("ssh", False))
+    branch_pref = args.branch or cfg.get("branch")
+    branch = ensure_git(branch_pref)
+
+    # .gitignore for C + Python + editor/OS junk; auto-written under -y.
+    if QUICK and not (ROOT / ".gitignore").exists():
+        ignore()
+    touched = ignore(PROJECT_CONFIG)
+
+    # Repo: -r always wins; otherwise ALWAYS ask which repo, with the remembered
+    # project repo as the Enter-default.
+    repo = args.repo
+    owner = None
+    if not repo:
+        if QUICK:
+            repo = ROOT.name.strip().replace(" ", "-")
+        else:
+            owner = get_username()
+            repo = pick_repo(owner, default=cfg.get("repo"))
+            if not repo:
+                repo = ask(f"Push to which repo (owner/name, Enter = {ROOT.name}): ") \
+                       or ROOT.name.strip().replace(" ", "-")
+
+    newcfg = {"branch": branch, "ssh": ssh}
+    if repo:
+        newcfg["repo"] = repo
+    if newcfg != {k: cfg.get(k) for k in newcfg}:
+        if save_json(cfgpath, newcfg):
+            log(f"remembered repo/branch/transport in {PROJECT_CONFIG}")
+
+    # Files: explicit args, -y (everything), or the numbered picker.
+    changed = changed_files()
+    if args.files:
+        rootpaths = []
+        for f in args.files:
+            fp = Path(f)
+            fp = fp if fp.is_absolute() else ROOT / fp
+            if not fp.exists():
+                die(f"no such file: {fp}")
+            rootpaths.append(fp)
+        paths = rootpaths
+    elif QUICK:
+        paths = [ROOT / p for p in changed]
+    else:
+        paths = [ROOT / p for p in pick_files(changed)]
+
+    if touched:
+        paths.append(ROOT / ".gitignore")
+    paths = list(dict.fromkeys(paths))  # dedupe
+
+    if not paths:
+        log("no changes to push")
+
+    # Stage, optionally eyeball the diff, and back out / reselect if it's wrong.
+    staged = []
+    while paths:
+        staged = stage(paths)
+        if not staged:
+            log("nothing staged")
+            break
+        log(f"staged: {', '.join(staged)}")
+        if not ask_yes("Show `git diff --cached` before committing?", False):
+            break
+        git("diff --cached")
+        if ask_yes("Commit this?"):
+            break
+        unstage()
+        if QUICK:
+            die("stopped (nothing committed, nothing pushed)")
+        if not ask_yes("Pick different files?"):
+            die("stopped before committing (nothing committed, nothing pushed)")
+        paths = [ROOT / p for p in pick_files(changed_files())]
+
+    if not staged:
+        log("nothing committed; nothing to push")
+        return
+
+    commit(staged, args.message)
+    ensure_remote(args.public, repo, ssh, owner)
+    push(branch, ssh)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
