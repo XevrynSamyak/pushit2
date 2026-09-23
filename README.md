@@ -1,6 +1,6 @@
 # push
 
-A standalone, no-dependency GitHub pusher. Python stdlib only — no install, no pip.
+A standalone, no-dependency GitHub pusher. Python stdlib only — no install, no pip. You can upload your code directly from vscode terminal.
 
 ## Install
 
